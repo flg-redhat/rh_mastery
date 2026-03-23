@@ -2,7 +2,8 @@
     "settings": {
         "base_url": "https://docs.redhat.com/en/documentation",
         "portal_url": "https://docs.redhat.com/en/products",
-        "download_base": "./Notebookml/RHDocumentation"
+        "download_base": "./Notebookml/RHDocumentation",
+        "markdown_subdir": "markdown"
     },
     "aliases": {
         "3scale": "red_hat_3scale_api_management",

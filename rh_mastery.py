@@ -4,7 +4,7 @@ import json
 import argparse
 import requests
 import re
-import shutil
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from packaging import version as py_version
@@ -13,8 +13,208 @@ def get_aliases():
     try:
         with open('rh_config.json', 'r') as f:
             return json.load(f).get('aliases', {})
-    except:
+    except Exception:
         return {"ocp": "openshift_container_platform", "ansible": "ansible_automation_platform"}
+
+
+def resolve_product_slugs(args, master):
+    """
+    Shared product selection for ``sync`` and ``convert`` (``--all``, ``--product``, alias flags).
+
+    Returns ``(slugs, force_version)``. ``force_version`` is set only when exactly one slug
+    is selected and ``args.force_version`` is provided.
+    """
+    aliases = get_aliases()
+    tracked = master.config.get("tracked_products", {})
+    slugs = []
+    if getattr(args, "all", False):
+        slugs = list(tracked.keys())
+    elif getattr(args, "product", None):
+        slugs = [args.product]
+    else:
+        selected = next((aliases[a] for a in aliases if getattr(args, a, False)), None)
+        if selected:
+            slugs = [selected]
+    fv = getattr(args, "force_version", None)
+    force_version = fv if len(slugs) == 1 else None
+    return slugs, force_version
+
+
+def report_empty_slug_selection(args):
+    """User-facing error when ``resolve_product_slugs`` returns no slugs."""
+    if getattr(args, "all", False):
+        print("❌ tracked_products is empty; run sync for at least one product first.")
+    else:
+        print("❌ Product flag required (e.g. --ocp, --ansible, --acm, --all, or --product SLUG).")
+
+
+def markdown_subdir_from_config(config):
+    return (config.get("settings") or {}).get("markdown_subdir", "markdown")
+
+
+def enumerate_pdfs(base_path, slug, version):
+    """PDF files directly under ``{base_path}/{slug}/{version}/`` (not subfolders)."""
+    d = os.path.join(base_path, slug, version)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for name in sorted(os.listdir(d)):
+        if not name.lower().endswith(".pdf"):
+            continue
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            out.append(p)
+    return out
+
+
+def _pdf_display_title(pdf_path):
+    try:
+        import fitz
+
+        doc = fitz.open(pdf_path)
+        try:
+            meta = doc.metadata or {}
+            t = (meta.get("title") or "").strip()
+            if t:
+                return t
+        finally:
+            doc.close()
+    except Exception:
+        pass
+    return os.path.splitext(os.path.basename(pdf_path))[0]
+
+
+def _pdf_to_markdown_pymupdf(pdf_path):
+    """Default engine: PyMuPDF4LLM when it works, else PyMuPDF per-page ``get_text('markdown')``."""
+    try:
+        import pymupdf4llm
+
+        md = pymupdf4llm.to_markdown(pdf_path)
+        if md and str(md).strip():
+            return str(md)
+    except Exception:
+        pass
+    import fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        parts = []
+        for page in doc:
+            parts.append(page.get_text("markdown") or "")
+        return "\n\n".join(parts)
+    finally:
+        doc.close()
+
+
+def _pdf_to_markdown_docling(pdf_path, converter):
+    result = converter.convert(str(pdf_path))
+    return result.document.export_to_markdown() or ""
+
+
+def _yaml_front_matter(fields):
+    """Minimal YAML front matter; string values JSON-encoded for safe quoting."""
+    lines = ["---"]
+    for k, v in fields.items():
+        if v is None:
+            continue
+        lines.append(f"{k}: {json.dumps(str(v))}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def convert_pdf_file(
+    pdf_path,
+    out_md_path,
+    *,
+    engine,
+    slug,
+    version,
+    docling_converter=None,
+):
+    """Convert one PDF to markdown with provenance header; writes ``out_md_path``."""
+    title = _pdf_display_title(pdf_path)
+    rel_pdf = os.path.relpath(os.path.abspath(pdf_path), start=os.getcwd())
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if engine == "docling":
+        body = _pdf_to_markdown_docling(pdf_path, docling_converter)
+    else:
+        body = _pdf_to_markdown_pymupdf(pdf_path)
+    fm = _yaml_front_matter(
+        {
+            "title": title,
+            "source_pdf": rel_pdf,
+            "converted_at": ts,
+            "engine": engine,
+            "slug": slug,
+            "version": version,
+        }
+    )
+    text = f"{fm}\n\n{body.strip()}\n"
+    os.makedirs(os.path.dirname(out_md_path), exist_ok=True)
+    with open(out_md_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def run_convert(master, args):
+    """CLI handler for ``convert``."""
+    engine = getattr(args, "engine", "pymupdf") or "pymupdf"
+    if engine not in ("pymupdf", "docling"):
+        print(f"❌ Unknown engine: {engine!r} (use pymupdf or docling).")
+        return
+    if engine == "docling":
+        try:
+            from docling.document_converter import DocumentConverter
+        except ImportError:
+            print(
+                "❌ Docling is not installed. Install with: pip install -r requirements-docling.txt"
+            )
+            return
+        docling_converter = DocumentConverter()
+    else:
+        docling_converter = None
+
+    slugs, force_version = resolve_product_slugs(args, master)
+    if not slugs:
+        report_empty_slug_selection(args)
+        return
+
+    tracked = master.config.get("tracked_products", {})
+    mdir = markdown_subdir_from_config(master.config)
+    base = master.base_path
+    force = getattr(args, "force", False)
+
+    for slug in slugs:
+        ver = force_version if force_version else tracked.get(slug)
+        if not ver:
+            print(
+                f"❌ No version for {slug!r} in tracked_products; run sync first or pass -v for a single product."
+            )
+            continue
+        pdf_paths = enumerate_pdfs(base, slug, ver)
+        if not pdf_paths:
+            print(f"⚠️ No PDFs under {os.path.join(base, slug, ver)} — skip.")
+            continue
+        print(f"📄 Converting {len(pdf_paths)} PDF(s) for {slug} @ {ver} (engine={engine})...")
+        for pdf_path in pdf_paths:
+            stem = os.path.splitext(os.path.basename(pdf_path))[0]
+            out_dir = os.path.join(base, slug, ver, mdir)
+            out_md = os.path.join(out_dir, f"{stem}.md")
+            if os.path.exists(out_md) and not force:
+                print(f"   ⏭️  skip (exists): {stem}.md")
+                continue
+            try:
+                convert_pdf_file(
+                    pdf_path,
+                    out_md,
+                    engine=engine,
+                    slug=slug,
+                    version=ver,
+                    docling_converter=docling_converter,
+                )
+                print(f"   ✅ {stem}.md")
+            except Exception as e:
+                print(f"   ❌ {stem}: {e}")
+
 
 class RHDocsMaster:
     def __init__(self, config_path='rh_config.json'):
@@ -156,13 +356,36 @@ def _cli_prog():
     return os.path.basename(sys.argv[0]) if sys.argv else "rh-mastery"
 
 
+def _add_product_selection_to_parser(parser):
+    """``--all``, ``--product``, per-alias flags, ``-v`` / ``--force-version`` (same as sync/convert)."""
+    aliases = get_aliases()
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="All products listed in tracked_products (same selection rules as sync)",
+    )
+    parser.add_argument(
+        "--product",
+        metavar="SLUG",
+        help="Documentation slug (e.g. red_hat_advanced_cluster_management_for_kubernetes)",
+    )
+    for alias in sorted(aliases.keys()):
+        parser.add_argument(f"--{alias}", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "-v",
+        "--force-version",
+        metavar="VER",
+        dest="force_version",
+        help="Pin version when exactly one product is selected (overrides tracked_products for that run)",
+    )
+
+
 def _build_argparser(parser_cls=argparse.ArgumentParser):
     """Build the CLI parser. *parser_cls* is :class:`RHArgumentParser` for the real entrypoint."""
-    aliases = get_aliases()
     prog = _cli_prog()
     parser = parser_cls(
         prog=prog,
-        description="Mirror Red Hat product documentation (PDFs) from docs.redhat.com.",
+        description="Mirror Red Hat product documentation (PDFs) from docs.redhat.com; optional PDF→Markdown conversion.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -170,26 +393,31 @@ def _build_argparser(parser_cls=argparse.ArgumentParser):
             "  %(prog)s sync --acm -v 2.16   # or --force-version 2.16\n"
             "  %(prog)s sync --product red_hat_quay\n"
             "  %(prog)s sync --all\n"
+            "  %(prog)s convert --ansible\n"
+            "  %(prog)s convert --all --force\n"
+            "  %(prog)s convert --product red_hat_quay --engine docling\n"
             "  %(prog)s help\n"
             "  %(prog)s -h\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", title="commands", metavar="COMMAND")
     sync_p = subparsers.add_parser("sync", help="Download docs for one or more products")
-    sync_p.add_argument("--all", action="store_true", help="Sync all tracked products")
-    sync_p.add_argument(
-        "--product",
-        metavar="SLUG",
-        help="Sync by documentation slug (e.g. red_hat_advanced_cluster_management_for_kubernetes)",
+    _add_product_selection_to_parser(sync_p)
+    convert_p = subparsers.add_parser(
+        "convert",
+        help="Convert mirrored PDFs to Markdown under settings.markdown_subdir (default: markdown/)",
     )
-    for alias in sorted(aliases.keys()):
-        sync_p.add_argument(f"--{alias}", action="store_true", help=argparse.SUPPRESS)
-    sync_p.add_argument(
-        "-v",
-        "--force-version",
-        metavar="VER",
-        dest="force_version",
-        help="Pin documentation version (single-product sync only; overrides auto-detect)",
+    _add_product_selection_to_parser(convert_p)
+    convert_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing .md files",
+    )
+    convert_p.add_argument(
+        "--engine",
+        choices=("pymupdf", "docling"),
+        default="pymupdf",
+        help="Conversion backend (default: pymupdf). docling needs: pip install -r requirements-docling.txt",
     )
     subparsers.add_parser(
         "list-options",
@@ -225,7 +453,7 @@ def help(stream=None):
     width = max(len(a) for a in aliases) if aliases else 0
     for alias in sorted(aliases.keys()):
         print(f"  --{alias:<{width}}  {aliases[alias]}", file=stream)
-    print(f"\n  ({len(aliases)} product flags on ``sync``.)", file=stream)
+    print(f"\n  ({len(aliases)} product flags on ``sync`` and ``convert``.)", file=stream)
 
 
 def print_cli_options(stream=None):
@@ -245,23 +473,16 @@ def main():
         help()
         return
     if args.command == "sync":
-        aliases = get_aliases()
         master = RHDocsMaster()
-        slugs_to_sync = []
-        if getattr(args, "all", False):
-            slugs_to_sync = list(master.config.get("tracked_products", {}).keys())
-        elif getattr(args, "product", None):
-            slugs_to_sync = [args.product]
-        else:
-            selected_slug = next((aliases[a] for a in aliases if getattr(args, a, False)), None)
-            if selected_slug:
-                slugs_to_sync = [selected_slug]
+        slugs_to_sync, force_ver = resolve_product_slugs(args, master)
         if not slugs_to_sync:
-            print("❌ Product flag required (e.g. --ocp, --ansible, --acm, --all, or --product SLUG).")
+            report_empty_slug_selection(args)
             return
-        force_ver = args.force_version if len(slugs_to_sync) == 1 else None
         for slug in slugs_to_sync:
             master.sync_product(slug, force_version=force_ver)
+    elif args.command == "convert":
+        master = RHDocsMaster()
+        run_convert(master, args)
     else:
         parser.print_help()
 

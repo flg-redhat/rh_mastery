@@ -1,6 +1,6 @@
 # rh-mastery
 
-Mirror **Red Hat product documentation** from [docs.redhat.com](https://docs.redhat.com) as PDFs for offline reading. The tool discovers the current documentation version for each product, downloads PDFs into a local directory tree, and stores the last-synced version in `rh_config.json`.
+Mirror **Red Hat product documentation** from [docs.redhat.com](https://docs.redhat.com) as PDFs for offline reading. The tool discovers the current documentation version for each product, downloads PDFs into a local directory tree, and stores the last-synced version in `rh_config.json`. The **`convert`** command turns those PDFs into Markdown (for humans and agents), using the same product selection as **`sync`**.
 
 You can run it as **`python3 rh_mastery.py …`** or use the **`rh-mastery`** bash wrapper (same arguments, no `python` prefix).
 
@@ -14,6 +14,7 @@ You can run it as **`python3 rh_mastery.py …`** or use the **`rh-mastery`** ba
 | **PDF mirroring** | Fetches PDFs from explicit `/pdf/` links or, for many products, from topic URLs like `…/{version}/pdf/{topic}/`. |
 | **Product catalog** | `rh_config.json` maps short CLI names to Red Hat documentation slugs (aligned with the [product index](https://docs.redhat.com/en/products)). |
 | **Flexible sync** | One product by alias, by slug, or all tracked products in one run. |
+| **PDF → Markdown** | `convert` writes readable `.md` next to mirrored PDFs (default: `markdown/` under each version dir), with YAML front matter for provenance. |
 | **Help** | `help()` / `-h` / `--help` / `help` / `list-options` — full command list and alias table (see [CLI help](#cli-help)). |
 
 ---
@@ -27,13 +28,13 @@ You can run it as **`python3 rh_mastery.py …`** or use the **`rh-mastery`** ba
 pip install -r requirements.txt
 ```
 
-(`requests`, `beautifulsoup4`, `packaging`)
+(`requests`, `beautifulsoup4`, `packaging`, `pymupdf4llm` for `convert`)
 
 ---
 
 ## `rh-mastery` wrapper (recommended)
 
-The **`rh-mastery`** executable in this repo is a thin bash wrapper around **`rh_mastery.py`**. It resolves `python3` (or `python`), runs the script from the **same directory as the wrapper**, passes **`"$@"`** through unchanged, and sets **`RH_MASTERY_PROG=rh-mastery`** so `-h` / `--help` show **`rh-mastery`** as the program name (direct `python3 rh_mastery.py …` still shows **`rh_mastery.py`**).
+The **`rh-mastery`** executable in this repo is a thin bash wrapper around **`rh_mastery.py`**. It resolves `python3` (or `python`), finds **`rh_mastery.py`** next to the wrapper’s real path (**symlinks are followed**, so e.g. **`/usr/local/bin/rh-mastery`** → **`/opt/rh-mastery/`** in the container works), passes **`"$@"`** through unchanged, and sets **`RH_MASTERY_PROG=rh-mastery`** so `-h` / `--help` show **`rh-mastery`** as the program name (direct `python3 rh_mastery.py …` still shows **`rh_mastery.py`**).
 
 | You run | Same as |
 |---------|---------|
@@ -71,6 +72,7 @@ Run the script from the directory that contains **`rh_config.json`**, or adjust 
 |-----|---------|
 | `settings.base_url` | Documentation base URL (default: `https://docs.redhat.com/en/documentation`). |
 | `settings.download_base` | Root folder for downloaded PDFs (e.g. `./Notebookml/RHDocumentation`). |
+| `settings.markdown_subdir` | Subfolder under each `{slug}/{version}/` for converted Markdown (default: `markdown`). |
 | `settings.portal_url` | Product index (informational; default points at the Red Hat docs product list). |
 | `aliases` | Short name → documentation slug (e.g. `acm` → `red_hat_advanced_cluster_management_for_kubernetes`). |
 | `tracked_products` | Slug → last successfully synced version string (updated after each successful sync). |
@@ -78,6 +80,12 @@ Run the script from the directory that contains **`rh_config.json`**, or adjust 
 PDFs are written to:
 
 `{download_base}/{slug}/{version}/`
+
+Converted Markdown (from `convert`) is written to:
+
+`{download_base}/{slug}/{version}/{markdown_subdir}/{topic}.md`
+
+Each file starts with a short YAML front matter block (`title`, `source_pdf`, `converted_at`, `engine`, `slug`, `version`).
 
 ---
 
@@ -136,6 +144,23 @@ rh-mastery sync --acm --force-version 2.16
 rh-mastery sync --all
 ```
 
+### PDF → Markdown (`convert`)
+
+Product selection matches **`sync`**: `--all`, `--product SLUG`, or an alias flag (`--ansible`, `--ocp`, …). The version comes from **`tracked_products`** in `rh_config.json` unless you pass **`-v` / `--force-version`** with **exactly one** product (same rules as sync). Run **`sync`** first so PDFs and tracked versions exist.
+
+```bash
+# Default engine: PyMuPDF4LLM (falls back to PyMuPDF per-page markdown if needed)
+rh-mastery convert --ansible
+rh-mastery convert --all
+rh-mastery convert --product red_hat_quay --force   # overwrite existing .md
+
+# Optional: Docling (heavier; better on some complex layouts). Install deps first:
+# pip install -r requirements-docling.txt
+rh-mastery convert --acm --engine docling
+```
+
+**Optional Docling:** [`requirements-docling.txt`](requirements-docling.txt) adds the **Docling** stack (large download, more CPU/RAM). Use it only when you need stronger layout/table handling than the default pipeline.
+
 ---
 
 ## Container image (UBI 10 + systemd)
@@ -171,6 +196,7 @@ podman run -d --name rh-mastery \
 podman exec -it rh-mastery bash
 rh-mastery --help
 rh-mastery sync --ansible
+rh-mastery convert --ansible
 ```
 
 ### Schedule with systemd (timer)
@@ -225,7 +251,8 @@ podman exec -it rh-mastery systemctl status crond
 | `rh_mastery.py` | CLI, `help()`, version discovery, PDF mirror |
 | `rh-mastery` | Executable bash wrapper (forwards all args to `rh_mastery.py`) |
 | `rh_config.json` | Settings, aliases, tracked versions |
-| `requirements.txt` | Python dependencies |
+| `requirements.txt` | Python dependencies (includes `pymupdf4llm` for `convert`) |
+| `requirements-docling.txt` | Optional stack for `convert --engine docling` |
 | `Containerfile` | UBI 10 `ubi-init` image with systemd + app install |
 | `container/systemd/` | `rh-mastery-sync.service` / `.timer` for optional scheduling |
 | `container/cron/` | Example crontab fragment |

@@ -5,7 +5,18 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# Follow symlinks so this works when installed as e.g. /usr/local/bin/rh-mastery -> /opt/rh-mastery/rh-mastery.
+_script_real_dir() {
+    local s="${BASH_SOURCE[0]:-$0}"
+    while [[ -h "$s" ]]; do
+        local d
+        d="$(cd -P "$(dirname "$s")" && pwd)"
+        s="$(readlink "$s")"
+        [[ "$s" != /* ]] && s="${d}/${s}"
+    done
+    cd -P "$(dirname "$s")" && pwd
+}
+SCRIPT_DIR="$(_script_real_dir)"
 PY_SCRIPT="${SCRIPT_DIR}/rh_mastery.py"
 
 if [[ ! -f "$PY_SCRIPT" ]]; then
