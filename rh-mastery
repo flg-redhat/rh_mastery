@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Wrapper for rh_mastery.py — use: rh-mastery [ARGS...]
+# Same as: python3 /path/to/rh_mastery.py [ARGS...]
+# Examples: rh-mastery help | rh-mastery sync --ansible | rh-mastery -h
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PY_SCRIPT="${SCRIPT_DIR}/rh_mastery.py"
+
+if [[ ! -f "$PY_SCRIPT" ]]; then
+    echo "rh-mastery: cannot find rh_mastery.py next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+    exec env RH_MASTERY_PROG=rh-mastery python3 "$PY_SCRIPT" "$@"
+elif command -v python >/dev/null 2>&1; then
+    exec env RH_MASTERY_PROG=rh-mastery python "$PY_SCRIPT" "$@"
+else
+    echo "rh-mastery: neither python3 nor python found in PATH" >&2
+    exit 1
+fi
