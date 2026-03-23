@@ -1,0 +1,32 @@
+# Same rules as `.containerignore` (Docker reads this file only).
+
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*.pyo
+.Python
+.venv
+venv
+env
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+htmlcov
+.coverage
+*.egg-info
+dist
+build
+
+# Local documentation mirrors (matches default download_base in rh_config.json)
+Notebookml
+RHDocumentation
+
+# Editor / tooling
+.cursor
+.idea
+.vscode
