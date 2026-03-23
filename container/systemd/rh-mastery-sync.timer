@@ -1,0 +1,12 @@
+# Weekly sync. Enable with: systemctl enable --now rh-mastery-sync.timer
+
+[Unit]
+Description=Weekly timer for rh-mastery documentation mirror
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target

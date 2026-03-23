@@ -149,11 +149,19 @@ class RHArgumentParser(argparse.ArgumentParser):
         help(stream=file or sys.stdout)
 
 
+def _cli_prog():
+    """Invocation name for argparse (wrapper sets RH_MASTERY_PROG=rh-mastery)."""
+    if os.environ.get("RH_MASTERY_PROG"):
+        return os.environ["RH_MASTERY_PROG"]
+    return os.path.basename(sys.argv[0]) if sys.argv else "rh-mastery"
+
+
 def _build_argparser(parser_cls=argparse.ArgumentParser):
     """Build the CLI parser. *parser_cls* is :class:`RHArgumentParser` for the real entrypoint."""
     aliases = get_aliases()
+    prog = _cli_prog()
     parser = parser_cls(
-        prog="rh_mastery.py",
+        prog=prog,
         description="Mirror Red Hat product documentation (PDFs) from docs.redhat.com.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -210,7 +218,7 @@ def help(stream=None):
     if stream is None:
         stream = sys.stdout
     parser = _build_argparser(argparse.ArgumentParser)
-    print("RH Mirror Manager — all commands and options\n", file=stream)
+    print(f"{_cli_prog()} — all commands and options\n", file=stream)
     parser.print_help(file=stream)
     aliases = get_aliases()
     print("\n--- Product aliases (--<name> → docs.redhat.com slug) ---\n", file=stream)

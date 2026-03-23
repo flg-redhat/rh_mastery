@@ -1,0 +1,5 @@
+# Example cron job for rh-mastery (copy to /etc/cron.d/rh-mastery and chmod 0644).
+# Cron requires crond running: systemctl enable --now crond
+#
+# Minute Hour Day Month DOW User Command
+0 4 * * 0 root cd /var/lib/rh-mastery && /opt/rh-mastery/rh-mastery sync --all

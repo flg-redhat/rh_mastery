@@ -1,0 +1,17 @@
+# Run once: mirror all tracked products (heavy). Override with drop-in or mask timer.
+# WorkingDirectory must contain rh_config.json (use a volume on /var/lib/rh-mastery).
+
+[Unit]
+Description=rh-mastery — sync all tracked Red Hat documentation PDFs
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/lib/rh-mastery
+ExecStart=/opt/rh-mastery/rh-mastery sync --all
+# Log to journal; adjust --all or use a single product via override if preferred.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
