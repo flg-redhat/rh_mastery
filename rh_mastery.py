@@ -9,6 +9,8 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from packaging import version as py_version
 
+DEFAULT_STORAGE_CONFIG = "rh_storage.json"
+
 def get_aliases():
     try:
         with open('rh_config.json', 'r') as f:
@@ -50,6 +52,49 @@ def report_empty_slug_selection(args):
 
 def markdown_subdir_from_config(config):
     return (config.get("settings") or {}).get("markdown_subdir", "markdown")
+
+
+def load_storage_config(path=DEFAULT_STORAGE_CONFIG):
+    """
+    Optional storage config for where synced files are written.
+    Falls back silently to legacy ``settings.download_base`` when missing.
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Could not read {path}: {e}. Falling back to settings.download_base.")
+        return {}
+
+
+def resolve_download_base(config, storage_cfg):
+    """
+    Resolve final base path for mirrored files.
+    Priority:
+      1) ``rh_storage.json``: ``download_base`` (explicit full path)
+      2) ``rh_storage.json``: ``mount_point`` + ``sync_subdir``
+      3) legacy ``rh_config.json``: ``settings.download_base``
+    """
+    settings = config.get("settings") or {}
+    legacy = settings.get("download_base", "./Notebookml/RHDocumentation")
+    if not storage_cfg:
+        return legacy
+
+    explicit = storage_cfg.get("download_base")
+    if explicit:
+        return os.path.normpath(explicit)
+
+    mount_point = storage_cfg.get("mount_point")
+    sync_subdir = storage_cfg.get("sync_subdir", "RHDocumentation")
+    if mount_point:
+        if os.path.isabs(sync_subdir):
+            return os.path.normpath(sync_subdir)
+        if sync_subdir:
+            return os.path.normpath(os.path.join(mount_point, sync_subdir))
+        return os.path.normpath(mount_point)
+    return legacy
 
 
 def enumerate_pdfs(base_path, slug, version):
@@ -217,10 +262,12 @@ def run_convert(master, args):
 
 
 class RHDocsMaster:
-    def __init__(self, config_path='rh_config.json'):
+    def __init__(self, config_path='rh_config.json', storage_config_path=DEFAULT_STORAGE_CONFIG):
         self.config_path = config_path
+        self.storage_config_path = storage_config_path
         self.config = self.load_config()
-        self.base_path = self.config['settings']['download_base']
+        self.storage_config = load_storage_config(self.storage_config_path)
+        self.base_path = resolve_download_base(self.config, self.storage_config)
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0'})
 

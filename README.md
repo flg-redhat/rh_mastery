@@ -60,18 +60,18 @@ rh-mastery sync --ansible
 ln -s /path/to/rh_mastery/rh-mastery ~/bin/rh-mastery
 ```
 
-**Working directory:** `rh_config.json` is loaded from the **current working directory** (not from the wrapper’s install path). `cd` to the directory that contains your config before running `rh-mastery`, or keep config next to your project and run from there.
+**Working directory:** `rh_config.json` and optional `rh_storage.json` are loaded from the **current working directory** (not from the wrapper's install path). `cd` to the directory that contains your config files before running `rh-mastery`.
 
 ---
 
 ## Configuration
 
-Run the script from the directory that contains **`rh_config.json`**, or adjust paths as needed.
+Run the script from the directory that contains **`rh_config.json`** (and optionally **`rh_storage.json`**), or adjust paths as needed.
 
 | Key | Purpose |
 |-----|---------|
 | `settings.base_url` | Documentation base URL (default: `https://docs.redhat.com/en/documentation`). |
-| `settings.download_base` | Root folder for downloaded PDFs (e.g. `./Notebookml/RHDocumentation`). |
+| `settings.download_base` | Legacy default root for downloaded PDFs. Used when `rh_storage.json` is missing. |
 | `settings.markdown_subdir` | Subfolder under each `{slug}/{version}/` for converted Markdown (default: `markdown`). |
 | `settings.portal_url` | Product index (informational; default points at the Red Hat docs product list). |
 | `aliases` | Short name → documentation slug (e.g. `acm` → `red_hat_advanced_cluster_management_for_kubernetes`). |
@@ -80,6 +80,11 @@ Run the script from the directory that contains **`rh_config.json`**, or adjust 
 PDFs are written to:
 
 `{download_base}/{slug}/{version}/`
+
+`download_base` is resolved from `rh_storage.json` first:
+
+- `download_base` (explicit full path), or
+- `mount_point` + `sync_subdir` (recommended for separate drive mounts).
 
 Converted Markdown (from `convert`) is written to:
 
@@ -167,7 +172,7 @@ rh-mastery convert --acm --engine docling
 
 The **`Containerfile`** builds an image from **[Red Hat Universal Base Image 10 Init](https://catalog.redhat.com/en/software/containers/ubi10/ubi-init/66f2b3428a972331bb915d51)** (`registry.access.redhat.com/ubi10/ubi-init`). That variant runs **`/sbin/init`** (systemd) as PID 1 so you can use **`systemctl`**, **timers**, and **`crond`** inside the container.
 
-The image installs this repository under **`/opt/rh-mastery`**, sets **`download_base`** to **`/var/lib/rh-mastery/RHDocumentation`**, and keeps **`rh_config.json`** under **`/var/lib/rh-mastery`** (use a **volume** there to persist config and mirrors).
+The image installs this repository under **`/opt/rh-mastery`**, sets storage to **`/var/lib/rh-mastery/RHDocumentation`** via **`rh_storage.json`**, and keeps **`rh_config.json`** + **`rh_storage.json`** under **`/var/lib/rh-mastery`** (use a **volume** there to persist config and mirrors).
 
 ### Build
 
@@ -188,7 +193,7 @@ podman run -d --name rh-mastery \
 ```
 
 - **`--systemd=always`** lets systemd run as init and **`systemctl`** work as expected inside the container.
-- Mount **`/var/lib/rh-mastery`** so `rh_config.json` and downloaded PDFs survive container recreation.
+- Mount **`/var/lib/rh-mastery`** so `rh_config.json`, `rh_storage.json`, and downloaded PDFs survive container recreation.
 
 ### One-off commands
 
@@ -238,7 +243,7 @@ podman exec -it rh-mastery systemctl status crond
 | Path | Purpose |
 |------|---------|
 | `/opt/rh-mastery/` | Application (`rh_mastery.py`, `rh-mastery`, deps) |
-| `/var/lib/rh-mastery/` | `rh_config.json`, mirrored PDFs (volume recommended) |
+| `/var/lib/rh-mastery/` | `rh_config.json`, `rh_storage.json`, mirrored PDFs (volume recommended) |
 | `/etc/systemd/system/rh-mastery-sync.{service,timer}` | Optional scheduled sync |
 | `/usr/share/doc/rh-mastery/cron/` | Cron example |
 
@@ -250,7 +255,8 @@ podman exec -it rh-mastery systemctl status crond
 |------|------|
 | `rh_mastery.py` | CLI, `help()`, version discovery, PDF mirror |
 | `rh-mastery` | Executable bash wrapper (forwards all args to `rh_mastery.py`) |
-| `rh_config.json` | Settings, aliases, tracked versions |
+| `rh_config.json` | Product settings, aliases, tracked versions |
+| `rh_storage.json` | Storage path config (`mount_point`, `sync_subdir`, or explicit `download_base`) |
 | `requirements.txt` | Python dependencies (includes `pymupdf4llm` for `convert`) |
 | `requirements-docling.txt` | Optional stack for `convert --engine docling` |
 | `Containerfile` | UBI 10 `ubi-init` image with systemd + app install |

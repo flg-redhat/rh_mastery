@@ -21,14 +21,23 @@ RUN pip3 install --no-cache-dir -r requirements.txt \
 # Persistent config + downloads (mount a volume here at runtime)
 RUN mkdir -p /var/lib/rh-mastery
 COPY rh_config.json /var/lib/rh-mastery/rh_config.json
+COPY rh_storage.json /var/lib/rh-mastery/rh_storage.json
 RUN python3 <<'PY'
 import json
-path = "/var/lib/rh-mastery/rh_config.json"
-with open(path) as f:
+cfg_path = "/var/lib/rh-mastery/rh_config.json"
+with open(cfg_path) as f:
     cfg = json.load(f)
 cfg["settings"]["download_base"] = "/var/lib/rh-mastery/RHDocumentation"
-with open(path, "w") as f:
+with open(cfg_path, "w") as f:
     json.dump(cfg, f, indent=4)
+
+storage_path = "/var/lib/rh-mastery/rh_storage.json"
+with open(storage_path) as f:
+    storage = json.load(f)
+storage["mount_point"] = "/var/lib/rh-mastery"
+storage["sync_subdir"] = "RHDocumentation"
+with open(storage_path, "w") as f:
+    json.dump(storage, f, indent=4)
 PY
 
 COPY container/systemd/rh-mastery-sync.service /etc/systemd/system/
