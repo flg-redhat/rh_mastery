@@ -185,12 +185,28 @@ podman build -f Containerfile -t rh-mastery:latest .
 
 ### Run (Podman + systemd)
 
+**Named volume** (default; Podman manages storage inside the VM):
+
 ```bash
 podman run -d --name rh-mastery \
   --systemd=always \
   -v rh-mastery-data:/var/lib/rh-mastery \
   rh-mastery:latest
 ```
+
+**Bind-mount a host directory** (recommended on macOS with Podman machine — files are directly accessible on the host):
+
+```bash
+mkdir -p ./data
+podman run -d --name rh-mastery \
+  --systemd=always \
+  -v ./data:/var/lib/rh-mastery:Z \
+  rh-mastery:latest
+```
+
+On first boot `rh-mastery-init.service` detects an empty volume and seeds `rh_config.json` and `rh_storage.json` from the built-in defaults. Subsequent starts leave existing files untouched. Downloaded PDFs and converted Markdown will appear under `./data/RHDocumentation/`.
+
+> **macOS / Podman machine note:** Podman automatically shares paths under `/Users` with the VM via virtfs, so any subdirectory of your home folder works as a bind-mount source without extra configuration.
 
 - **`--systemd=always`** lets systemd run as init and **`systemctl`** work as expected inside the container.
 - Mount **`/var/lib/rh-mastery`** so `rh_config.json`, `rh_storage.json`, and downloaded PDFs survive container recreation.
