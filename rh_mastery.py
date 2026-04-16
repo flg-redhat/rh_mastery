@@ -201,7 +201,7 @@ def convert_pdf_file(
 
 
 def run_convert(master, args):
-    """CLI handler for ``convert``."""
+    """CLI handler for ``convert`` (mirrored PDFs only; uses rh_config / rh_storage paths)."""
     engine = getattr(args, "engine", "pymupdf") or "pymupdf"
     if engine not in ("pymupdf", "docling"):
         print(f"❌ Unknown engine: {engine!r} (use pymupdf or docling).")
@@ -328,14 +328,80 @@ class RHDocsMaster:
             return None
 
     def _discover_pdf_urls(self, slug, ver, page_url, soup, res_text):
-        """Collect PDF URLs: first from explicit /pdf/ links, then from topic paths."""
+        """Collect downloadable PDF URLs from docs pages (direct links or /pdf/* index pages)."""
+        def resolve_download_url(candidate_url):
+            """
+            Return a direct PDF URL for *candidate_url*.
+            docs.redhat now often serves /pdf/<topic>/ as HTML index pages containing the
+            real *.pdf URL inside page scripts/state.
+            """
+            try:
+                head = self.session.head(candidate_url, allow_redirects=True, timeout=12)
+                final = head.url
+                ctype = (head.headers.get("Content-Type") or "").lower()
+                cdisp = (head.headers.get("Content-Disposition") or "").lower()
+                if head.status_code == 200 and (
+                    ctype.startswith("application/pdf")
+                    or final.lower().split("?", 1)[0].endswith(".pdf")
+                    or ".pdf" in cdisp
+                ):
+                    return final
+            except Exception:
+                pass
+
+            try:
+                res = self.session.get(candidate_url, allow_redirects=True, timeout=20)
+                if res.status_code != 200:
+                    return None
+                # JSON/script blobs often escape slashes as \/.
+                text = res.text.replace("\\/", "/")
+                # Prefer absolute links, then site-relative links.
+                patterns = [
+                    r'https?://[^"\'>\s]+\.pdf(?:\?[^"\'>\s]*)?',
+                    r'/en/documentation/[^"\'>\s]+\.pdf(?:\?[^"\'>\s]*)?',
+                ]
+                seen = set()
+                for pat in patterns:
+                    for m in re.findall(pat, text, flags=re.IGNORECASE):
+                        full = urljoin("https://docs.redhat.com", m)
+                        if "docs.redhat.com" not in full:
+                            continue
+                        if f"/documentation/{slug}/{ver}/pdf/" not in full:
+                            continue
+                        if full in seen:
+                            continue
+                        seen.add(full)
+                        try:
+                            h2 = self.session.head(full, allow_redirects=True, timeout=12)
+                            c2 = (h2.headers.get("Content-Type") or "").lower()
+                            d2 = (h2.headers.get("Content-Disposition") or "").lower()
+                            if h2.status_code == 200 and (
+                                c2.startswith("application/pdf")
+                                or h2.url.lower().split("?", 1)[0].endswith(".pdf")
+                                or ".pdf" in d2
+                            ):
+                                return h2.url
+                        except Exception:
+                            continue
+            except Exception:
+                return None
+            return None
+
         # Strategy 1: Explicit PDF links (e.g. legacy or some products)
         pdfs = []
+        seen_urls = set()
         for a in soup.find_all('a', href=True):
             href = a['href']
             if '/pdf' in href or (href.endswith('.pdf') and slug in href):
                 full = urljoin("https://docs.redhat.com", href)
-                pdfs.append((full.split('/')[-1] or f"doc_{len(pdfs)}.pdf", full))
+                resolved = resolve_download_url(full)
+                if not resolved or resolved in seen_urls:
+                    continue
+                seen_urls.add(resolved)
+                name = os.path.basename(resolved.split("?", 1)[0]) or f"doc_{len(pdfs)}.pdf"
+                if not name.lower().endswith(".pdf"):
+                    name = f"{name}.pdf"
+                pdfs.append((name, resolved))
         if pdfs:
             return pdfs
         # Strategy 2: Topic-based PDFs — Red Hat serves PDF at /pdf/{topic}/ for many products (e.g. AAP)
@@ -344,13 +410,15 @@ class RHDocsMaster:
         segments = set(re.findall(pattern, res_text))
         base = f"{self.config['settings']['base_url']}/{slug}/{ver}/pdf"
         for seg in sorted(segments):
-            pdf_url = f"{base}/{seg}/"
-            try:
-                head = self.session.head(pdf_url, allow_redirects=True, timeout=10)
-                if head.status_code == 200 and (head.headers.get('Content-Type') or '').startswith('application/pdf'):
-                    pdfs.append((f"{seg}.pdf", pdf_url))
-            except Exception:
-                pass
+            candidate = f"{base}/{seg}/"
+            resolved = resolve_download_url(candidate)
+            if not resolved or resolved in seen_urls:
+                continue
+            seen_urls.add(resolved)
+            name = os.path.basename(resolved.split("?", 1)[0]) or f"{seg}.pdf"
+            if not name.lower().endswith(".pdf"):
+                name = f"{seg}.pdf"
+            pdfs.append((name, resolved))
         return pdfs
 
     def mirror(self, slug, ver):

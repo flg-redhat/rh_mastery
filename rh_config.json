@@ -113,7 +113,7 @@
         "red_hat_3scale_api_management": "2.16",
         "red_hat_application_foundations": "2024",
         "red_hat_build_of_apicurio_registry": "3.1",
-        "red_hat_build_of_apache_camel": "4.18",
+        "red_hat_build_of_apache_camel": "4.14",
         "red_hat_ansible_lightspeed_with_ibm_watsonx_code_assistant": "2.",
         "red_hat_ansible_inside": "1.3",
         "ansible_on_clouds": "2.",

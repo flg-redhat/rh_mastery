@@ -32,6 +32,21 @@ pip install -r requirements.txt
 
 ---
 
+## RPM package (RHEL 10)
+
+A specfile and helper script build a **binary RPM** (vendored Python wheels, systemd units, `/etc` + `/var/lib` layout). See **[packaging/rpm/README.md](packaging/rpm/README.md)** and run `./packaging/rpm/build-rpm.sh` on a RHEL 10 build host with network access for `pip` during `rpmbuild`.
+
+---
+
+## tokensaver (bundled, independent)
+
+The **[tokensaver/](tokensaver/)** subdirectory is a separate CLI and Python package for PDF / docx / ODP → Markdown. It does **not** import `rh_mastery` or read `rh_config.json` / `rh_storage.json`. **rh-mastery** keeps its own **`convert`** for mirrored PDFs only.
+
+- Install: `cd tokensaver && pip install -e .`
+- Container: `podman build -f tokensaver/Containerfile -t tokensaver:latest .` (state volume: **`/var/lib/tokensaver`**)
+
+---
+
 ## `rh-mastery` wrapper (recommended)
 
 The **`rh-mastery`** executable in this repo is a thin bash wrapper around **`rh_mastery.py`**. It resolves `python3` (or `python`), finds **`rh_mastery.py`** next to the wrapper’s real path (**symlinks are followed**, so e.g. **`/usr/local/bin/rh-mastery`** → **`/opt/rh-mastery/`** in the container works), passes **`"$@"`** through unchanged, and sets **`RH_MASTERY_PROG=rh-mastery`** so `-h` / `--help` show **`rh-mastery`** as the program name (direct `python3 rh_mastery.py …` still shows **`rh_mastery.py`**).
@@ -90,7 +105,7 @@ Converted Markdown (from `convert`) is written to:
 
 `{download_base}/{slug}/{version}/{markdown_subdir}/{topic}.md`
 
-Each file starts with a short YAML front matter block (`title`, `source_pdf`, `converted_at`, `engine`, `slug`, `version`).
+Each file starts with a short YAML front matter block (`title`, `source` or `source_pdf`, `converted_at`, `engine`, `slug`, `version` depending on converter).
 
 ---
 
@@ -165,6 +180,8 @@ rh-mastery convert --acm --engine docling
 ```
 
 **Optional Docling:** [`requirements-docling.txt`](requirements-docling.txt) adds the **Docling** stack (large download, more CPU/RAM). Use it only when you need stronger layout/table handling than the default pipeline.
+
+For Markdown from **arbitrary** paths (any folder or files outside the mirror layout), use the bundled **tokensaver** tool in [`tokensaver/`](tokensaver/README.md): `pip install -e ./tokensaver`, then `tokensaver convert -d … -o …` or `-f … -o …`. It is **independent** of `rh-mastery` (no shared config). On servers/containers, use **`/var/lib/tokensaver`** as the data directory (see `tokensaver/README.md` and `tokensaver/Containerfile`).
 
 ---
 
@@ -263,6 +280,8 @@ podman exec -it rh-mastery systemctl status crond
 | `container/systemd/` | `rh-mastery-sync.service` / `.timer` for optional scheduling |
 | `container/cron/` | Example crontab fragment |
 | `.containerignore` / `.dockerignore` | Exclude VCS, venvs, caches, and local mirror dirs from the image build context (Podman and Docker) |
+| `packaging/rpm/` | RHEL 10 RPM spec, systemd snippets for the package, `build-rpm.sh` |
+| `tokensaver/` | Standalone PDF/docx/odp → Markdown tool (`/var/lib/tokensaver` in container docs) |
 
 ---
 
