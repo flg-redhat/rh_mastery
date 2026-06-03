@@ -11,6 +11,12 @@ from urllib.parse import urljoin
 from packaging import version as py_version
 
 DEFAULT_STORAGE_CONFIG = "rh_storage.json"
+DEFAULT_AUTH_CONFIG = "rh_auth.json"
+SSO_TOKEN_URL = (
+    "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+)
+SSO_CLIENT_ID = "rhsm-api"
+CURL_CFFI_IMPERSONATE = "chrome131"
 
 DOCS_BROWSER_HEADERS = {
     "User-Agent": (
@@ -29,6 +35,130 @@ DOCS_BROWSER_HEADERS = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
 }
+
+
+def _expand_path(path):
+    return os.path.expanduser(path) if path else path
+
+
+def load_auth_config(path=DEFAULT_AUTH_CONFIG):
+    """
+    Optional auth for docs.redhat.com (Bearer token and/or browser cookies).
+    Secrets via ``RH_OFFLINE_TOKEN``, ``RH_OFFLINE_TOKEN_FILE``, ``RH_COOKIE_FILE``,
+    or ``rh_auth.json`` (see ``rh_auth.example.json``).
+    """
+    cfg = {}
+    config_path = os.environ.get("RH_AUTH_CONFIG", path)
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print(f"⚠️ Could not read {config_path}: {e}")
+
+    if os.environ.get("RH_OFFLINE_TOKEN"):
+        cfg["offline_token"] = os.environ["RH_OFFLINE_TOKEN"]
+    if os.environ.get("RH_OFFLINE_TOKEN_FILE"):
+        cfg["offline_token_file"] = os.environ["RH_OFFLINE_TOKEN_FILE"]
+    if os.environ.get("RH_COOKIE_FILE"):
+        cfg["cookie_file"] = os.environ["RH_COOKIE_FILE"]
+    return cfg
+
+
+def _read_secret_file(path):
+    path = _expand_path(path)
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        return f.read().strip()
+
+
+def get_red_hat_access_token(offline_token):
+    res = requests.post(
+        SSO_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "client_id": SSO_CLIENT_ID,
+            "refresh_token": offline_token,
+        },
+        timeout=30,
+    )
+    res.raise_for_status()
+    return res.json()["access_token"]
+
+
+def _load_cookie_file(session, cookie_file):
+    import http.cookiejar
+
+    path = _expand_path(cookie_file)
+    if not path or not os.path.exists(path):
+        print(f"⚠️ Cookie file not found: {cookie_file}")
+        return
+    jar = http.cookiejar.MozillaCookieJar(path)
+    jar.load(ignore_discard=True, ignore_expires=True)
+    for cookie in jar:
+        session.cookies.set(
+            cookie.name,
+            cookie.value,
+            domain=cookie.domain,
+            path=cookie.path,
+        )
+
+
+def create_docs_session(auth_cfg=None):
+    """
+    HTTP session for docs.redhat.com.
+
+    Uses ``curl_cffi`` with Chrome TLS impersonation when installed (required to
+    pass Akamai bot checks). Optionally attaches Red Hat SSO bearer token and/or
+    cookies from a logged-in browser export.
+    """
+    if auth_cfg is None:
+        auth_cfg = load_auth_config()
+
+    backend = "requests"
+    try:
+        from curl_cffi import requests as curl_requests
+
+        session = curl_requests.Session(impersonate=CURL_CFFI_IMPERSONATE)
+        backend = f"curl_cffi/{CURL_CFFI_IMPERSONATE}"
+    except ImportError:
+        session = requests.Session()
+        print(
+            "⚠️ curl_cffi is not installed; docs.redhat.com may return HTTP 403. "
+            "Install with: pip install curl_cffi"
+        )
+
+    session.headers.update(DOCS_BROWSER_HEADERS)
+
+    auth_bits = []
+    offline_token = auth_cfg.get("offline_token") or _read_secret_file(
+        auth_cfg.get("offline_token_file")
+    )
+    if offline_token:
+        try:
+            access_token = get_red_hat_access_token(offline_token)
+            session.headers["Authorization"] = f"Bearer {access_token}"
+            auth_bits.append("Red Hat bearer token")
+        except Exception as e:
+            print(f"⚠️ Red Hat token refresh failed: {e}")
+
+    cookie_file = auth_cfg.get("cookie_file")
+    if cookie_file:
+        _load_cookie_file(session, cookie_file)
+        auth_bits.append(f"cookies ({cookie_file})")
+
+    try:
+        session.get("https://docs.redhat.com/", timeout=20, allow_redirects=True)
+    except Exception:
+        pass
+
+    if auth_bits:
+        print(f"🔐 HTTP backend: {backend} ({', '.join(auth_bits)})")
+    elif backend != "requests":
+        print(f"🔐 HTTP backend: {backend}")
+    return session, backend
+
 
 def get_aliases():
     try:
@@ -281,14 +411,20 @@ def run_convert(master, args):
 
 
 class RHDocsMaster:
-    def __init__(self, config_path='rh_config.json', storage_config_path=DEFAULT_STORAGE_CONFIG):
+    def __init__(
+        self,
+        config_path='rh_config.json',
+        storage_config_path=DEFAULT_STORAGE_CONFIG,
+        auth_config_path=DEFAULT_AUTH_CONFIG,
+    ):
         self.config_path = config_path
         self.storage_config_path = storage_config_path
+        self.auth_config_path = auth_config_path
         self.config = self.load_config()
         self.storage_config = load_storage_config(self.storage_config_path)
         self.base_path = resolve_download_base(self.config, self.storage_config)
-        self.session = requests.Session()
-        self.session.headers.update(DOCS_BROWSER_HEADERS)
+        auth_cfg = load_auth_config(self.auth_config_path)
+        self.session, self.http_backend = create_docs_session(auth_cfg)
 
     def load_config(self):
         with open(self.config_path, 'r') as f:
@@ -686,14 +822,17 @@ class RHDocsMaster:
             fpath = os.path.join(save_dir, name)
             if not os.path.exists(fpath):
                 print(f"   📥 {name}")
-                with self.session.get(
+                r = self.session.get(
                     pdf_url,
                     stream=True,
                     headers={"Referer": url},
-                ) as r:
-                    with open(fpath, 'wb') as f:
+                )
+                try:
+                    with open(fpath, "wb") as f:
                         for chunk in r.iter_content(8192):
                             f.write(chunk)
+                finally:
+                    r.close()
 
     def sync_product(self, slug, force_version=None):
         latest = force_version if force_version else self.get_latest_remote_version(slug)
