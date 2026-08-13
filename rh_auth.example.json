@@ -1,0 +1,4 @@
+{
+    "offline_token_file": "~/.config/rh-mastery/offline.token",
+    "cookie_file": "~/.config/rh-mastery/redhat_cookies.txt"
+}

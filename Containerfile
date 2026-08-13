@@ -14,6 +14,7 @@ RUN dnf -y install \
 
 WORKDIR /opt/rh-mastery
 COPY requirements.txt rh_mastery.py rh-mastery ./
+COPY rh_okf/ ./rh_okf/
 RUN pip3 install --no-cache-dir -r requirements.txt \
     && chmod +x rh-mastery \
     && ln -sf /opt/rh-mastery/rh-mastery /usr/local/bin/rh-mastery

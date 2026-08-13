@@ -15,6 +15,7 @@ You can run it as **`python3 rh_mastery.py …`** or use the **`rh-mastery`** ba
 | **Product catalog** | `rh_config.json` maps short CLI names to Red Hat documentation slugs (aligned with the [product index](https://docs.redhat.com/en/products)). |
 | **Flexible sync** | One product by alias, by slug, or all tracked products in one run. |
 | **PDF → Markdown** | `convert` writes readable `.md` next to mirrored PDFs (default: `markdown/` under each version dir), with YAML front matter for provenance. |
+| **PDF → OKF** | `convert --format okf` writes Markdown first, then an [OKF v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md) bundle under `okf/` for agent/RAG consumption. |
 | **Help** | `help()` / `-h` / `--help` / `help` / `list-options` — full command list and alias table (see [CLI help](#cli-help)). |
 
 ---
@@ -88,6 +89,10 @@ Run the script from the directory that contains **`rh_config.json`** (and option
 | `settings.base_url` | Documentation base URL (default: `https://docs.redhat.com/en/documentation`). |
 | `settings.download_base` | Legacy default root for downloaded PDFs. Used when `rh_storage.json` is missing. |
 | `settings.markdown_subdir` | Subfolder under each `{slug}/{version}/` for converted Markdown (default: `markdown`). |
+| `settings.okf_bundle_root` | OKF bundle root under `download_base` (default: `okf`). |
+| `settings.okf_chunk_heading_level` | Heading level for OKF concept splits (default: `2` = `##`). |
+| `settings.okf_max_concept_chars` | Max characters per concept before overflow split (default: `12000`; `0` = disable). |
+| `settings.okf_spec_version` | OKF spec version written to global bundle `index.md` (default: `0.2`). |
 | `settings.portal_url` | Product index (informational; default points at the Red Hat docs product list). |
 | `aliases` | Short name → documentation slug (e.g. `acm` → `red_hat_advanced_cluster_management_for_kubernetes`). |
 | `tracked_products` | Slug → last successfully synced version string (updated after each successful sync). |
@@ -106,6 +111,12 @@ Converted Markdown (from `convert`) is written to:
 `{download_base}/{slug}/{version}/{markdown_subdir}/{topic}.md`
 
 Each file starts with a short YAML front matter block (`title`, `source` or `source_pdf`, `converted_at`, `engine`, `slug`, `version` depending on converter).
+
+OKF bundles (from `convert --format okf`) are written to:
+
+`{download_base}/okf/{slug}/{version}/{guide_stem}/`
+
+Attach **`{download_base}/okf/`** for the full corpus, or **`{download_base}/okf/{slug}/{version}/`** for one product version. Markdown under `markdown/` is always retained as the reference extraction layer.
 
 ---
 
@@ -166,18 +177,27 @@ rh-mastery sync --all
 
 ### PDF → Markdown (`convert`)
 
-Product selection matches **`sync`**: `--all`, `--product SLUG`, or an alias flag (`--ansible`, `--ocp`, …). The version comes from **`tracked_products`** in `rh_config.json` unless you pass **`-v` / `--force-version`** with **exactly one** product (same rules as sync). Run **`sync`** first so PDFs and tracked versions exist.
+**Default:** convert the **entire on-disk mirror** under `download_base` — no product flag required. rh-mastery discovers every `{slug}/{version}/` directory that contains PDFs or Markdown.
+
+**Partial convert:** pass **`--product SLUG`**, any alias flag (`--ansible`, `--offline_knowledge_portal`, …), or **`--all`** (only products listed in `tracked_products`).
+
+| Goal | Command |
+|------|---------|
+| **Convert entire mirror** (default) | `rh-mastery convert --format okf` |
+| **Sync updates, then convert all** | `rh-mastery convert --format okf --sync-first` |
+| **One product only** | `rh-mastery convert --offline_knowledge_portal --format okf` |
+| **Tracked products only** | `rh-mastery convert --all --format okf` |
+
+By default, **`convert` never contacts docs.redhat.com** — it only reads PDFs/Markdown on disk. Pass **`--sync-first`** to refresh downloads before converting.
 
 ```bash
-# Default engine: PyMuPDF4LLM (falls back to PyMuPDF per-page markdown if needed)
-rh-mastery convert --ansible
-rh-mastery convert --all
-rh-mastery convert --product red_hat_quay --force   # overwrite existing .md
-
-# Optional: Docling (heavier; better on some complex layouts). Install deps first:
-# pip install -r requirements-docling.txt
-rh-mastery convert --acm --engine docling
+rh-mastery convert --format okf              # entire mirror → OKF
+rh-mastery convert --ansible --format okf    # partial: Ansible only
+rh-mastery convert --all --format okf        # tracked_products subset
+rh-mastery convert --format okf --sync-first   # sync all targets, then convert
 ```
+
+**`--format okf`** runs the full pipeline in one command: **(1) PDF→Markdown** (always written to `markdown/` as reference), then **(2) Markdown→OKF bundle**. You do not need a separate Markdown step. The default PDF engine for OKF is **docling** on non-FIPS hosts; on **RHEL/OpenSSL FIPS** systems rh-mastery automatically uses **pymupdf** with plain-text extraction. Override with `--engine pymupdf`; `--engine docling` fails fast on FIPS. See [`docs/OKF_IMPLEMENTATION_SPEC.md`](docs/OKF_IMPLEMENTATION_SPEC.md) for bundle layout and agent attachment.
 
 **Optional Docling:** [`requirements-docling.txt`](requirements-docling.txt) adds the **Docling** stack (large download, more CPU/RAM). Use it only when you need stronger layout/table handling than the default pipeline.
 

@@ -53,6 +53,8 @@ that directory or copy configs to your working directory.
 install -d %{buildroot}%{_prefix}/lib/%{pkgname}/vendor
 install -m0644 rh_mastery.py %{buildroot}%{_prefix}/lib/%{pkgname}/
 install -m0755 rh-mastery %{buildroot}%{_prefix}/lib/%{pkgname}/
+install -d %{buildroot}%{_prefix}/lib/%{pkgname}/rh_okf
+install -m0644 rh_okf/*.py %{buildroot}%{_prefix}/lib/%{pkgname}/rh_okf/
 
 # Vendored site-packages (requires network during rpmbuild unless wheels are prefetched).
 pip3 install \

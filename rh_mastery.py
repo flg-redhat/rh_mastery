@@ -17,6 +17,9 @@ SSO_TOKEN_URL = (
 )
 SSO_CLIENT_ID = "rhsm-api"
 CURL_CFFI_IMPERSONATE = "chrome131"
+DOCS_REQUEST_TIMEOUT = 60
+DOCS_REQUEST_RETRIES = 2
+SYNC_PAUSE_SECONDS = 1.0
 
 DOCS_BROWSER_HEADERS = {
     "User-Agent": (
@@ -191,16 +194,169 @@ def resolve_product_slugs(args, master):
     return slugs, force_version
 
 
+def has_partial_convert_selection(args):
+    """True when the user narrowed ``convert`` to specific product(s) via flags."""
+    if getattr(args, "product", None):
+        return True
+    return any(getattr(args, alias, False) for alias in get_aliases())
+
+
 def report_empty_slug_selection(args):
-    """User-facing error when ``resolve_product_slugs`` returns no slugs."""
+    """User-facing error when ``resolve_product_slugs`` returns no slugs (sync)."""
     if getattr(args, "all", False):
         print("❌ tracked_products is empty; run sync for at least one product first.")
     else:
         print("❌ Product flag required (e.g. --ocp, --ansible, --acm, --all, or --product SLUG).")
 
 
+def report_empty_convert_targets():
+    print("❌ No mirrored products found under download_base (no PDF/Markdown directories).")
+
+
+def list_mirrored_products(base_path, markdown_subdir, okf_bundle_root="okf"):
+    """
+    Discover ``(slug, version)`` pairs present on disk under ``download_base``.
+
+    A directory qualifies when it contains at least one PDF or Markdown file.
+    """
+    out = []
+    if not os.path.isdir(base_path):
+        return out
+    skip_top = {okf_bundle_root}
+    for slug in sorted(os.listdir(base_path)):
+        if slug in skip_top:
+            continue
+        slug_dir = os.path.join(base_path, slug)
+        if not os.path.isdir(slug_dir):
+            continue
+        for ver in sorted(os.listdir(slug_dir)):
+            ver_dir = os.path.join(slug_dir, ver)
+            if not os.path.isdir(ver_dir):
+                continue
+            if enumerate_pdfs(base_path, slug, ver):
+                out.append((slug, ver))
+                continue
+            mdir = os.path.join(ver_dir, markdown_subdir)
+            if os.path.isdir(mdir) and any(
+                name.endswith(".md") for name in os.listdir(mdir)
+            ):
+                out.append((slug, ver))
+    return out
+
+
+def resolve_convert_targets(args, master, base, mdir, okf_bundle_root):
+    """
+    Resolve ``(slug, version)`` pairs to convert.
+
+    Default (no product flags): every ``slug/version`` directory on disk under
+    ``download_base`` that contains PDFs or Markdown.
+
+    * ``--product`` / alias flags — partial convert for selected product(s).
+    * ``--all`` — every entry in ``tracked_products`` (config-driven subset).
+    * ``--all-mirrored`` — same as default (explicit); entire on-disk mirror.
+    """
+    tracked = master.config.get("tracked_products", {})
+
+    if getattr(args, "all_mirrored", False) or (
+        not getattr(args, "all", False) and not has_partial_convert_selection(args)
+    ):
+        return list_mirrored_products(base, mdir, okf_bundle_root)
+
+    if getattr(args, "all", False):
+        if not tracked:
+            print("❌ tracked_products is empty; use default convert for on-disk mirror.")
+            return []
+        return [(slug, ver) for slug, ver in sorted(tracked.items()) if ver]
+
+    slugs, force_version = resolve_product_slugs(args, master)
+    if not slugs:
+        return []
+
+    targets = []
+    for slug in slugs:
+        ver = force_version if force_version else tracked.get(slug)
+        if not ver:
+            ver = _newest_version_on_disk(base, slug)
+        if not ver:
+            print(
+                f"❌ No version for {slug!r}; run sync, pass -v, or omit flags to use on-disk versions."
+            )
+            continue
+        targets.append((slug, ver))
+    return targets
+
+
+def _newest_version_on_disk(base_path, slug):
+    """Return the lexicographically last version directory for *slug*, if any."""
+    slug_dir = os.path.join(base_path, slug)
+    if not os.path.isdir(slug_dir):
+        return None
+    versions = [
+        name
+        for name in os.listdir(slug_dir)
+        if os.path.isdir(os.path.join(slug_dir, name))
+    ]
+    return sorted(versions)[-1] if versions else None
+
+
 def markdown_subdir_from_config(config):
     return (config.get("settings") or {}).get("markdown_subdir", "markdown")
+
+
+def okf_settings_from_config(config):
+    """OKF bundle settings from ``rh_config.json`` ``settings``."""
+    s = config.get("settings") or {}
+    return {
+        "okf_bundle_root": s.get("okf_bundle_root", "okf"),
+        "okf_chunk_heading_level": int(s.get("okf_chunk_heading_level", 2)),
+        "okf_max_concept_chars": int(s.get("okf_max_concept_chars", 12000)),
+        "okf_spec_version": s.get("okf_spec_version", "0.2"),
+        "base_url": s.get("base_url", "https://docs.redhat.com/en/documentation"),
+    }
+
+
+def _ensure_rh_okf_path():
+    root = os.path.dirname(os.path.abspath(__file__))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def fips_mode_enabled():
+    """True when the kernel has crypto FIPS mode enabled (Linux)."""
+    try:
+        with open("/proc/sys/crypto/fips_enabled", encoding="utf-8") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def resolve_convert_engine(fmt, engine_arg):
+    """
+    Pick the PDF conversion engine, with FIPS-safe defaults.
+
+    Docling's ``DocumentConverter`` aborts on hosts with OpenSSL FIPS mode enabled
+    (common on RHEL FIPS). Fall back to pymupdf unless the user explicitly chose docling.
+    """
+    if engine_arg is not None:
+        engine = engine_arg
+    elif fmt == "okf":
+        engine = "docling"
+    else:
+        engine = "pymupdf"
+
+    if engine == "docling" and fips_mode_enabled():
+        if engine_arg == "docling":
+            print(
+                "❌ Docling cannot run on this host: OpenSSL FIPS mode is enabled and "
+                "DocumentConverter fails FIPS self-tests. Use --engine pymupdf instead."
+            )
+            return None
+        print(
+            "⚠️ OpenSSL FIPS mode is enabled; docling is unavailable here. "
+            "Using pymupdf for PDF→Markdown."
+        )
+        return "pymupdf"
+    return engine
 
 
 def load_storage_config(path=DEFAULT_STORAGE_CONFIG):
@@ -261,11 +417,40 @@ def enumerate_pdfs(base_path, slug, version):
     return out
 
 
+def is_valid_pdf(path):
+    """True when *path* looks like a readable PDF (magic bytes, minimum size)."""
+    try:
+        if os.path.getsize(path) < 128:
+            return False
+        with open(path, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
+def pdf_problem(path):
+    """Human-readable reason a mirrored file is not a valid PDF, or ``None`` if valid."""
+    if is_valid_pdf(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+    except OSError as exc:
+        return str(exc)
+    if b"AccessDenied" in head or head.startswith(b"<?xml"):
+        return "download failed (error page saved as .pdf — re-sync required)"
+    if head.startswith((b"<!DOCTYPE", b"<html", b"<HTML")):
+        return "download failed (HTML error page saved as .pdf — re-sync required)"
+    if len(head) < 128:
+        return "file too small to be a PDF — re-sync required"
+    return "not a valid PDF — re-sync required"
+
+
 def _pdf_display_title(pdf_path):
     try:
-        import fitz
+        import pymupdf
 
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         try:
             meta = doc.metadata or {}
             t = (meta.get("title") or "").strip()
@@ -279,22 +464,29 @@ def _pdf_display_title(pdf_path):
 
 
 def _pdf_to_markdown_pymupdf(pdf_path):
-    """Default engine: PyMuPDF4LLM when it works, else PyMuPDF per-page ``get_text('markdown')``."""
-    try:
-        import pymupdf4llm
+    """
+    PDF → markdown/text via pymupdf4llm when FIPS-safe, else pymupdf plain text per page.
 
-        md = pymupdf4llm.to_markdown(pdf_path)
-        if md and str(md).strip():
-            return str(md)
-    except Exception:
-        pass
-    import fitz
+    pymupdf4llm and docling both abort under OpenSSL FIPS mode on RHEL; on FIPS hosts we
+    extract plain text only (OKF chunking still works, but with fewer ``##`` headings).
+    """
+    if not fips_mode_enabled():
+        try:
+            import pymupdf4llm
 
-    doc = fitz.open(pdf_path)
+            md = pymupdf4llm.to_markdown(pdf_path)
+            if md and str(md).strip():
+                return str(md)
+        except Exception:
+            pass
+
+    import pymupdf
+
+    doc = pymupdf.open(pdf_path)
     try:
         parts = []
         for page in doc:
-            parts.append(page.get_text("markdown") or "")
+            parts.append(page.get_text("text") or "")
         return "\n\n".join(parts)
     finally:
         doc.close()
@@ -349,12 +541,175 @@ def convert_pdf_file(
         f.write(text)
 
 
+def _ensure_markdown_from_pdf(
+    pdf_path,
+    out_md_path,
+    *,
+    engine,
+    slug,
+    version,
+    docling_converter,
+    force,
+    stem,
+    fmt,
+):
+    """
+    Step 1 of the OKF pipeline: ensure reference Markdown exists.
+
+    Returns ``True`` when ``out_md_path`` is ready, ``False`` when the PDF cannot be converted.
+    """
+    if os.path.exists(out_md_path) and not force:
+        return True
+
+    problem = pdf_problem(pdf_path)
+    if problem:
+        print(f"   ❌ {stem}: {problem}")
+        return False
+
+    step = "Step 1/2 — PDF→Markdown" if fmt == "okf" else "PDF→Markdown"
+    print(f"   📝 {step}: {stem}.md")
+    try:
+        convert_pdf_file(
+            pdf_path,
+            out_md_path,
+            engine=engine,
+            slug=slug,
+            version=version,
+            docling_converter=docling_converter,
+        )
+        print(f"   ✅ {stem}.md")
+        return True
+    except Exception as e:
+        print(f"   ❌ {stem}: {e}")
+        return False
+
+
+def _build_okf_for_guide(
+    okf_mod,
+    *,
+    out_md_path,
+    bundle_root,
+    slug,
+    version,
+    guide_stem,
+    okf_cfg,
+    pdf_path,
+    force,
+):
+    """Step 2 of the OKF pipeline. Returns guide info dict or ``None`` on failure."""
+    if not os.path.exists(out_md_path):
+        print(f"   ⚠️  skip OKF (no Markdown yet): {guide_stem}")
+        return None
+    try:
+        info = okf_mod.build_guide_bundle(
+            out_md_path,
+            bundle_root=bundle_root,
+            slug=slug,
+            version=version,
+            guide_stem=guide_stem,
+            base_url=okf_cfg["base_url"],
+            pdf_path=pdf_path,
+            chunk_heading_level=okf_cfg["okf_chunk_heading_level"],
+            max_concept_chars=okf_cfg["okf_max_concept_chars"],
+            okf_spec_version=okf_cfg["okf_spec_version"],
+            force=force,
+        )
+        if info.get("skipped"):
+            print(f"   ⏭️  skip OKF (unchanged): {guide_stem}")
+        else:
+            n = info.get("concept_count", 0)
+            print(f"   ✅ Step 2/2 — OKF {guide_stem} ({n} concepts)")
+        return info
+    except Exception as e:
+        print(f"   ❌ OKF {guide_stem}: {e}")
+        return None
+
+
+def _convert_product_guides(
+    master,
+    *,
+    slug,
+    ver,
+    pdf_paths,
+    fmt,
+    engine,
+    docling_converter,
+    mdir,
+    base,
+    bundle_root,
+    okf_cfg,
+    okf_mod,
+    force,
+):
+    """Convert all guides for one product version. Returns (guide_infos, repair_stems)."""
+    guide_infos = []
+    repair_stems = []
+
+    for pdf_path in pdf_paths:
+        stem = os.path.splitext(os.path.basename(pdf_path))[0]
+        out_md = os.path.join(base, slug, ver, mdir, f"{stem}.md")
+        pdf_ok = is_valid_pdf(pdf_path)
+
+        if not pdf_ok:
+            if os.path.exists(out_md):
+                print(
+                    f"   ⚠️  {stem}: invalid PDF on disk; using existing Markdown "
+                    f"({pdf_problem(pdf_path)})"
+                )
+            else:
+                print(f"   ❌ {stem}: {pdf_problem(pdf_path)} (no Markdown — skipped)")
+                repair_stems.append(stem)
+                continue
+        elif os.path.exists(out_md) and not force:
+            print(f"   ⏭️  skip MD (exists): {stem}.md")
+        elif not _ensure_markdown_from_pdf(
+            pdf_path,
+            out_md,
+            engine=engine,
+            slug=slug,
+            version=ver,
+            docling_converter=docling_converter,
+            force=force,
+            stem=stem,
+            fmt=fmt,
+        ):
+            repair_stems.append(stem)
+            continue
+
+        if fmt != "okf":
+            continue
+
+        info = _build_okf_for_guide(
+            okf_mod,
+            out_md_path=out_md,
+            bundle_root=bundle_root,
+            slug=slug,
+            version=ver,
+            guide_stem=stem,
+            okf_cfg=okf_cfg,
+            pdf_path=pdf_path if pdf_ok else None,
+            force=force,
+        )
+        if info is not None:
+            guide_infos.append(info)
+
+    return guide_infos, repair_stems
+
+
 def run_convert(master, args):
     """CLI handler for ``convert`` (mirrored PDFs only; uses rh_config / rh_storage paths)."""
-    engine = getattr(args, "engine", "pymupdf") or "pymupdf"
+    fmt = getattr(args, "format", "markdown") or "markdown"
+    if fmt not in ("markdown", "okf"):
+        print(f"❌ Unknown format: {fmt!r} (use markdown or okf).")
+        return 1
+
+    engine_arg = getattr(args, "engine", None)
+    engine = resolve_convert_engine(fmt, engine_arg)
+    if engine is None:
+        return 1
     if engine not in ("pymupdf", "docling"):
         print(f"❌ Unknown engine: {engine!r} (use pymupdf or docling).")
-        return
+        return 1
     if engine == "docling":
         try:
             from docling.document_converter import DocumentConverter
@@ -362,52 +717,173 @@ def run_convert(master, args):
             print(
                 "❌ Docling is not installed. Install with: pip install -r requirements-docling.txt"
             )
-            return
+            return 1
         docling_converter = DocumentConverter()
     else:
         docling_converter = None
 
-    slugs, force_version = resolve_product_slugs(args, master)
-    if not slugs:
-        report_empty_slug_selection(args)
-        return
-
-    tracked = master.config.get("tracked_products", {})
     mdir = markdown_subdir_from_config(master.config)
+    okf_cfg = okf_settings_from_config(master.config)
     base = master.base_path
+    bundle_root = os.path.join(base, okf_cfg["okf_bundle_root"])
     force = getattr(args, "force", False)
+    sync_first = getattr(args, "sync_first", False)
 
-    for slug in slugs:
-        ver = force_version if force_version else tracked.get(slug)
-        if not ver:
-            print(
-                f"❌ No version for {slug!r} in tracked_products; run sync first or pass -v for a single product."
-            )
-            continue
+    targets = resolve_convert_targets(args, master, base, mdir, okf_cfg["okf_bundle_root"])
+    if not targets:
+        report_empty_convert_targets()
+        return 1
+
+    if has_partial_convert_selection(args) or getattr(args, "all", False):
+        scope = f"partial selection ({len(targets)} product/version target(s))"
+    else:
+        scope = f"entire on-disk mirror ({len(targets)} product/version target(s))"
+
+    if sync_first:
+        print(f"🔄 --sync-first: syncing {len(targets)} product/version target(s) before convert...")
+        sync_ok = 0
+        sync_fail = 0
+        for i, (slug, ver) in enumerate(targets):
+            try:
+                if master.sync_product(slug, force_version=ver):
+                    sync_ok += 1
+                else:
+                    sync_fail += 1
+            except Exception as exc:
+                sync_fail += 1
+                print(f"⚠️  Sync failed for {slug} @ {ver}: {exc}")
+            if i + 1 < len(targets):
+                time.sleep(SYNC_PAUSE_SECONDS)
+        print(f"🔄 Sync pass complete: {sync_ok} ok, {sync_fail} skipped/failed.")
+    else:
+        print(
+            f"📂 Mirror-only convert ({scope}): using PDFs/Markdown on disk "
+            f"(pass --sync-first to refresh from docs.redhat.com first)."
+        )
+
+    okf_mod = None
+    if fmt == "okf":
+        _ensure_rh_okf_path()
+        from rh_okf import bundle as okf_mod
+        print(
+            "📚 OKF pipeline: Step 1 PDF→Markdown (reference), then Step 2 Markdown→OKF bundle."
+        )
+
+    global_products = []
+    total_concepts = 0
+    total_guides = 0
+    total_skipped_repair = 0
+
+    for slug, ver in targets:
         pdf_paths = enumerate_pdfs(base, slug, ver)
         if not pdf_paths:
-            print(f"⚠️ No PDFs under {os.path.join(base, slug, ver)} — skip.")
-            continue
-        print(f"📄 Converting {len(pdf_paths)} PDF(s) for {slug} @ {ver} (engine={engine})...")
-        for pdf_path in pdf_paths:
-            stem = os.path.splitext(os.path.basename(pdf_path))[0]
-            out_dir = os.path.join(base, slug, ver, mdir)
-            out_md = os.path.join(out_dir, f"{stem}.md")
-            if os.path.exists(out_md) and not force:
-                print(f"   ⏭️  skip (exists): {stem}.md")
-                continue
-            try:
-                convert_pdf_file(
-                    pdf_path,
-                    out_md,
-                    engine=engine,
-                    slug=slug,
-                    version=ver,
-                    docling_converter=docling_converter,
+            if sync_first:
+                master.sync_product(slug, force_version=ver)
+                pdf_paths = enumerate_pdfs(base, slug, ver)
+            if not pdf_paths:
+                print(
+                    f"⚠️ No PDFs under {os.path.join(base, slug, ver)} — skip. "
+                    f"Use --sync-first to download."
                 )
-                print(f"   ✅ {stem}.md")
-            except Exception as e:
-                print(f"   ❌ {stem}: {e}")
+                continue
+        label = "Converting" if fmt == "markdown" else "Converting + OKF"
+        print(f"📄 {label} {len(pdf_paths)} PDF(s) for {slug} @ {ver} (engine={engine}, format={fmt})...")
+
+        guide_infos, repair_stems = _convert_product_guides(
+            master,
+            slug=slug,
+            ver=ver,
+            pdf_paths=pdf_paths,
+            fmt=fmt,
+            engine=engine,
+            docling_converter=docling_converter,
+            mdir=mdir,
+            base=base,
+            bundle_root=bundle_root,
+            okf_cfg=okf_cfg,
+            okf_mod=okf_mod,
+            force=force,
+        )
+
+        if repair_stems and sync_first:
+            print(
+                f"\n🔄 {len(repair_stems)} guide(s) still need valid PDFs — re-syncing "
+                f"{slug} @ {ver} and retrying..."
+            )
+            master.sync_product(slug, force_version=ver)
+            retry_pdfs = [
+                p
+                for p in enumerate_pdfs(base, slug, ver)
+                if os.path.splitext(os.path.basename(p))[0] in repair_stems
+            ]
+            retry_infos, still_failed = _convert_product_guides(
+                master,
+                slug=slug,
+                ver=ver,
+                pdf_paths=retry_pdfs,
+                fmt=fmt,
+                engine=engine,
+                docling_converter=docling_converter,
+                mdir=mdir,
+                base=base,
+                bundle_root=bundle_root,
+                okf_cfg=okf_cfg,
+                okf_mod=okf_mod,
+                force=True,
+            )
+            existing = {g["guide_stem"] for g in guide_infos}
+            for info in retry_infos:
+                if info["guide_stem"] not in existing:
+                    guide_infos.append(info)
+                else:
+                    for i, g in enumerate(guide_infos):
+                        if g["guide_stem"] == info["guide_stem"]:
+                            guide_infos[i] = info
+                            break
+            repair_stems = still_failed
+
+        if repair_stems:
+            total_skipped_repair += len(repair_stems)
+            hint = (
+                f"{_cli_prog()} convert --sync-first --product {slug} -v {ver}"
+                if not sync_first
+                else f"{_cli_prog()} sync --product {slug} -v {ver}"
+            )
+            print(
+                f"⚠️  {len(repair_stems)} guide(s) skipped ({', '.join(repair_stems)}). "
+                f"To re-download: {hint}"
+            )
+
+        for info in guide_infos:
+            total_guides += 1
+            if not info.get("skipped"):
+                total_concepts += info.get("concept_count", 0)
+
+        if fmt == "okf" and guide_infos:
+            okf_mod.build_product_index(bundle_root, slug, ver, guide_infos)
+            okf_mod.write_product_log(bundle_root, slug, ver, guide_infos, force=force)
+            global_products.append({"slug": slug, "version": ver, "guides": guide_infos})
+
+    if fmt == "okf" and global_products:
+        okf_mod.build_global_index(
+            bundle_root,
+            global_products,
+            okf_spec_version=okf_cfg["okf_spec_version"],
+        )
+        okf_mod.write_global_log(bundle_root, global_products, force=force)
+
+    if fmt == "okf":
+        print(
+            f"\n📚 OKF bundle: {bundle_root} "
+            f"({len(global_products)} product(s), {total_guides} guide(s), "
+            f"{total_concepts} new concept(s))"
+        )
+    if total_skipped_repair and not sync_first:
+        print(
+            f"\n💡 Tip: {total_skipped_repair} guide(s) had no usable PDF/Markdown. "
+            f"Run with --sync-first to refresh the mirror, then convert again."
+        )
+    return 0
 
 
 class RHDocsMaster:
@@ -437,7 +913,28 @@ class RHDocsMaster:
     def _fetch_docs_page(self, url, referer=None):
         """GET a docs page, following meta-refresh hops used by the remodeled site."""
         headers = {"Referer": referer} if referer else None
-        res = self.session.get(url, timeout=20, allow_redirects=True, headers=headers)
+        last_error = None
+        for attempt in range(DOCS_REQUEST_RETRIES + 1):
+            try:
+                res = self.session.get(
+                    url,
+                    timeout=DOCS_REQUEST_TIMEOUT,
+                    allow_redirects=True,
+                    headers=headers,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < DOCS_REQUEST_RETRIES:
+                    wait = 2**attempt
+                    print(f"   ⚠️  Request timed out, retrying in {wait}s ({url})...")
+                    time.sleep(wait)
+                    continue
+                print(f"❌ Network error fetching {url}: {exc}")
+                return None
+        else:
+            return None
+
         for _ in range(3):
             if res.status_code != 200 or "Access Denied" in res.text:
                 break
@@ -457,15 +954,75 @@ class RHDocsMaster:
             next_url = urljoin(res.url, refresh.group(1).strip())
             if next_url == res.url:
                 break
-            res = self.session.get(next_url, timeout=20, allow_redirects=True, headers=headers)
+            try:
+                res = self.session.get(
+                    next_url,
+                    timeout=DOCS_REQUEST_TIMEOUT,
+                    allow_redirects=True,
+                    headers=headers,
+                )
+            except Exception as exc:
+                print(f"❌ Network error following redirect to {next_url}: {exc}")
+                return None
         return res
 
     def _docs_page_ok(self, res):
         return (
-            res.status_code == 200
+            res is not None
+            and res.status_code == 200
             and "Access Denied" not in res.text
             and len(res.text) > 500
         )
+
+    def _collect_html_topics(self, slug, ver, soup, res_text):
+        """
+        HTML guide topic segments from remodeled docs pages.
+
+        Red Hat docs now emit both absolute paths
+        ``/documentation/{slug}/{ver}/html/{topic}`` and site-relative
+        ``/html/{topic}`` links in the SPA shell.
+        """
+        segments = set()
+        patterns = [
+            rf"/(?:en/)?documentation/{re.escape(slug)}/{re.escape(ver)}/html(?:[-_]single)?/([a-z0-9_]+)",
+            r"/html/(?:[-_]single)?/([a-z0-9_]+)",
+        ]
+        for pat in patterns:
+            segments.update(re.findall(pat, res_text, flags=re.I))
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"]
+            m = re.search(
+                rf"/(?:en/)?documentation/{re.escape(slug)}/{re.escape(ver)}/html/(?:[-_]single)?/([a-z0-9_]+)",
+                href,
+                flags=re.I,
+            )
+            if m:
+                segments.add(m.group(1))
+                continue
+            m = re.search(r"/html/(?:[-_]single)?/([a-z0-9_]+)", href, flags=re.I)
+            if m:
+                segments.add(m.group(1))
+        return segments
+
+    def _is_documentation_hub(self, slug, ver, res_text):
+        """True when the landing page links out to other products but has no own guides."""
+        own_guides = re.findall(
+            rf"/documentation/{re.escape(slug)}/{re.escape(ver)}/html/",
+            res_text,
+            flags=re.I,
+        )
+        rel_guides = re.findall(r'["\']/html/[a-z0-9_]+["\']', res_text, flags=re.I)
+        if own_guides or rel_guides:
+            return False
+        other_products = set(
+            re.findall(
+                r"/documentation/(red_hat_[a-z0-9_]+)/",
+                res_text,
+                flags=re.I,
+            )
+        )
+        other_products.discard(slug)
+        return len(other_products) >= 3
 
     def _docs_page_url(self, path):
         """Normalize site-relative documentation paths to configured ``base_url``."""
@@ -642,13 +1199,20 @@ class RHDocsMaster:
             discovered = []
 
             res = self._fetch_docs_page(url, referer="https://docs.redhat.com/")
-            landing_version = self._version_from_response(slug, res)
+            landing_version = None
+            if res is not None:
+                landing_version = self._version_from_response(slug, res)
+                if not landing_version and (
+                    res.status_code != 200 or "Access Denied" in res.text
+                ):
+                    print(
+                        f"⚠️ Portal returned HTTP {res.status_code} for {slug} landing page."
+                    )
+            else:
+                print(f"⚠️ Could not load landing page for {slug}.")
+
             if landing_version:
                 discovered.append(landing_version)
-            elif res.status_code != 200 or "Access Denied" in res.text:
-                print(
-                    f"⚠️ Portal returned HTTP {res.status_code} for {slug} landing page."
-                )
 
             probed = self._probe_existing_versions(
                 slug,
@@ -690,14 +1254,18 @@ class RHDocsMaster:
             """
             if candidate_url.lower().split("?", 1)[0].endswith(".pdf"):
                 try:
-                    head = self.session.head(candidate_url, allow_redirects=True, timeout=12)
+                    head = self.session.head(
+                        candidate_url, allow_redirects=True, timeout=DOCS_REQUEST_TIMEOUT
+                    )
                     if head.status_code == 200 and is_pdf_response(head):
                         return head.url
                 except Exception:
                     pass
 
             try:
-                head = self.session.head(candidate_url, allow_redirects=True, timeout=12)
+                head = self.session.head(
+                    candidate_url, allow_redirects=True, timeout=DOCS_REQUEST_TIMEOUT
+                )
                 final = head.url
                 if head.status_code == 200 and is_pdf_response(head):
                     return final
@@ -705,7 +1273,9 @@ class RHDocsMaster:
                 pass
 
             try:
-                res = self.session.get(candidate_url, allow_redirects=True, timeout=20)
+                res = self.session.get(
+                    candidate_url, allow_redirects=True, timeout=DOCS_REQUEST_TIMEOUT
+                )
                 if res.status_code != 200:
                     return None
                 if is_pdf_response(res):
@@ -730,7 +1300,9 @@ class RHDocsMaster:
                             continue
                         seen.add(full)
                         try:
-                            h2 = self.session.head(full, allow_redirects=True, timeout=12)
+                            h2 = self.session.head(
+                                full, allow_redirects=True, timeout=DOCS_REQUEST_TIMEOUT
+                            )
                             if h2.status_code == 200 and is_pdf_response(h2):
                                 return h2.url
                         except Exception:
@@ -788,9 +1360,8 @@ class RHDocsMaster:
         if pdfs:
             return pdfs
 
-        # Strategy 3: Topic-based PDFs — legacy /pdf/{topic}/ layout
-        pattern = rf'/{re.escape(slug)}/{re.escape(ver)}/html(?:[-_]single)?/([a-z0-9_]+)'
-        segments = set(re.findall(pattern, res_text))
+        # Strategy 3: Topic-based PDFs — /pdf/{topic}/ index pages (current docs.redhat.com layout)
+        segments = self._collect_html_topics(slug, ver, soup, res_text)
         base = f"{self.config['settings']['base_url']}/{slug}/{ver}/pdf"
         for seg in sorted(segments):
             candidate = f"{base}/{seg}/"
@@ -804,27 +1375,44 @@ class RHDocsMaster:
         save_dir = os.path.join(self.base_path, slug, ver)
         os.makedirs(save_dir, exist_ok=True)
         url = f"{self.config['settings']['base_url']}/{slug}/{ver}"
-        
+
         print(f"🛰️ Accessing documentation library at {url}...")
-        res = self._fetch_docs_page(url, referer="https://docs.redhat.com/")
+        try:
+            res = self._fetch_docs_page(url, referer="https://docs.redhat.com/")
+        except Exception as exc:
+            print(f"❌ Could not load documentation library: {exc}")
+            return False
         if not self._docs_page_ok(res):
-            print(f"❌ Could not load documentation library (HTTP {res.status_code}).")
-            return
-        soup = BeautifulSoup(res.text, 'html.parser')
+            status = res.status_code if res is not None else "network error"
+            print(f"❌ Could not load documentation library (HTTP {status}).")
+            return False
+        soup = BeautifulSoup(res.text, "html.parser")
         pdf_list = self._discover_pdf_urls(slug, ver, res.url, soup, res.text)
-        
+
         if not pdf_list:
-            print(f"❌ Could not find PDF links in the {ver} library.")
-            return
+            if self._is_documentation_hub(slug, ver, res.text):
+                print(
+                    f"ℹ️  {slug} @ {ver} is a documentation hub (links to other products; "
+                    f"no PDFs for this slug)."
+                )
+            else:
+                print(f"❌ Could not find PDF links in the {ver} library.")
+            return False
 
         print(f"📦 Mirroring {len(pdf_list)} files...")
         for name, pdf_url in pdf_list:
             fpath = os.path.join(save_dir, name)
-            if not os.path.exists(fpath):
+            if os.path.exists(fpath) and is_valid_pdf(fpath):
+                continue
+            if os.path.exists(fpath):
+                print(f"   🔄 Re-downloading invalid file: {name} ({pdf_problem(fpath)})")
+            else:
                 print(f"   📥 {name}")
+            try:
                 r = self.session.get(
                     pdf_url,
                     stream=True,
+                    timeout=DOCS_REQUEST_TIMEOUT,
                     headers={"Referer": url},
                 )
                 try:
@@ -833,17 +1421,32 @@ class RHDocsMaster:
                             f.write(chunk)
                 finally:
                     r.close()
+            except Exception as exc:
+                print(f"   ❌ {name}: download failed ({exc})")
+                continue
+            if not is_valid_pdf(fpath):
+                print(
+                    f"   ⚠️  {name}: still not a valid PDF after download "
+                    f"({pdf_problem(fpath)})"
+                )
+        return True
 
     def sync_product(self, slug, force_version=None):
-        latest = force_version if force_version else self.get_latest_remote_version(slug)
+        try:
+            latest = force_version if force_version else self.get_latest_remote_version(slug)
+        except Exception as exc:
+            print(f"❌ Version discovery failed for {slug}: {exc}")
+            return False
         if not latest:
-            print(f"❌ FATAL: Red Hat portal is not responding with version data for {slug}.")
-            return
+            print(f"❌ Could not resolve documentation version for {slug}.")
+            return False
 
         print(f"✅ Target Version: {latest}")
-        self.mirror(slug, latest)
-        self.config['tracked_products'][slug] = latest
-        self.save_config()
+        ok = self.mirror(slug, latest)
+        if ok:
+            self.config["tracked_products"][slug] = latest
+            self.save_config()
+        return ok
 
 
 class RHArgumentParser(argparse.ArgumentParser):
@@ -899,6 +1502,9 @@ def _build_argparser(parser_cls=argparse.ArgumentParser):
             "  %(prog)s sync --all\n"
             "  %(prog)s convert --ansible\n"
             "  %(prog)s convert --all --force\n"
+            "  %(prog)s convert --format okf\n"
+            "  %(prog)s convert --ansible --format okf\n"
+            "  %(prog)s convert --all --format okf --sync-first\n"
             "  %(prog)s convert --product red_hat_quay --engine docling\n"
             "  %(prog)s help\n"
             "  %(prog)s -h\n"
@@ -909,19 +1515,39 @@ def _build_argparser(parser_cls=argparse.ArgumentParser):
     _add_product_selection_to_parser(sync_p)
     convert_p = subparsers.add_parser(
         "convert",
-        help="Convert mirrored PDFs to Markdown under settings.markdown_subdir (default: markdown/)",
+        help="Convert mirrored PDFs to Markdown and optionally OKF bundles "
+        "(default: entire on-disk mirror; use product flags for partial convert)",
     )
     _add_product_selection_to_parser(convert_p)
     convert_p.add_argument(
+        "--all-mirrored",
+        action="store_true",
+        help="Convert entire on-disk mirror (same as default when no product flags are given)",
+    )
+    convert_p.add_argument(
+        "--sync-first",
+        action="store_true",
+        help="Sync selected product(s) from docs.redhat.com before converting "
+        "(full update + convert pipeline)",
+    )
+    convert_p.add_argument(
+        "--format",
+        choices=("markdown", "okf"),
+        default="markdown",
+        help="Output format: markdown (.md only) or okf (write .md then OKF bundle; "
+        "default engine: docling, or pymupdf on FIPS-enabled hosts)",
+    )
+    convert_p.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite existing .md files",
+        help="Overwrite existing .md and OKF concept files",
     )
     convert_p.add_argument(
         "--engine",
         choices=("pymupdf", "docling"),
-        default="pymupdf",
-        help="Conversion backend (default: pymupdf). docling needs: pip install -r requirements-docling.txt",
+        default=None,
+        help="PDF→Markdown backend (default: pymupdf, or docling when --format okf on non-FIPS hosts). "
+        "docling needs: pip install -r requirements-docling.txt",
     )
     subparsers.add_parser(
         "list-options",
