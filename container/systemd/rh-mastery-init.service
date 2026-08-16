@@ -1,0 +1,12 @@
+[Unit]
+Description=rh-mastery — seed /var/lib/rh-mastery with default config on first start
+DefaultDependencies=no
+Before=basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/rh-mastery/container-init.sh
+
+[Install]
+WantedBy=sysinit.target
